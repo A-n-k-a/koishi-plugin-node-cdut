@@ -25,16 +25,27 @@ export const PARKS = ['榕树园', '珙桐园', '松林园', '银杏园', '芙�
 
 export type Park = (typeof PARKS)[number]
 
+export type ElecType = '照明' | '空调'
+
+/** 'both' 表示照明和空调都查询 */
+export type RoomType = ElecType | 'both'
 
 export interface RoomConfig {
   /** 园区, 如 银杏园 */
   park?: Park
-  /** 用电类型 */
-  type?: '照明' | '空调'
+  /** 用电类型; both = 照明和空调都查询 */
+  type?: RoomType
   /** 栋号, 如 "1" */
   building?: string
   /** 房间号, 如 "512" */
   roomNo?: string
+}
+
+export interface TimeConfig {
+  /** 时长数值, 0 表示不启用 */
+  time: number
+  /** 时间单位 (换算为秒的乘数: 1 / 60 / 3600) */
+  unit: 1 | 60 | 3600
 }
 
 export interface Config {
@@ -42,10 +53,21 @@ export interface Config {
   username?: string
   password?: string
   room: RoomConfig
+  prefix: string
   keyword: string
   replyTemplate: string
+  chargeKeyword: string
+  chargeTemplate: string
   errorTemplate: string
+  cache: TimeConfig
+  rateLimit: TimeConfig
 }
+
+const timeUnit = Schema.union([
+  Schema.const(1).description('秒'),
+  Schema.const(60).description('分钟'),
+  Schema.const(3600).description('小时'),
+] as const).default(60).description('时间单位。')
 
 export const Config: Schema<Config> = Schema.object({
   baseUrl: Schema.string()
@@ -58,21 +80,45 @@ export const Config: Schema<Config> = Schema.object({
     .description('统一身份认证密码。'),
   room: Schema.object({
     park: Schema.union([...PARKS]).description('园区。'),
-    type: Schema.union(['照明', '空调'] as const).description('用电类型。'),
+    type: Schema.union([
+      Schema.const('照明' as const),
+      Schema.const('空调' as const),
+      Schema.const('both' as const).description('照明和空调'),
+    ]).description('用电类型。'),
     building: Schema.string().description('栋号, 如 `1`。'),
     roomNo: Schema.string().description('房间号, 如 `512` (新开普通道须为 ≥3 位纯数字)。'),
   }).description('默认查询的房间信息 (消息中未携带房间信息时使用)。'),
+  prefix: Schema.string()
+    .default('')
+    .description('指令前缀, 可以是任意字符串 (如 `！`、`/`); 留空表示不使用。设置后仅 `前缀+关键词` 可触发。'),
   keyword: Schema.string()
     .default('查电费')
-    .description('触发电费查询的关键词 (指令名, 不含空格)。'),
+    .pattern(/^\S+$/)
+    .description('查询电费的关键词 (不含空格)。'),
   replyTemplate: Schema.string()
     .role('textarea')
     .default('{park}{building}栋 {room} 房间{type}用电剩余 {remain} 度。')
-    .description('查询成功时的回复模板。可用变量: {park} {type} {building} {room} {remain} {total} {canbuy} {project}。'),
+    .description('查询成功时的回复模板 (照明+空调同时查询时逐行各渲染一次)。可用变量: {park} {type} {building} {room} {remain} {total} {canbuy} {project}。'),
+  chargeKeyword: Schema.string()
+    .default('充电费')
+    .pattern(/^\S+$/)
+    .description('充值电费的关键词 (不含空格)。'),
+  chargeTemplate: Schema.string()
+    .role('textarea')
+    .default('已为 {park}{building}栋 {room} 房间创建{type}电费充值订单 ({amount} 元, 订单号 {orderNo})。\n请扫码或打开链接支付: {payLink}')
+    .description('充值下单成功时的回复模板。可用变量: {amount} {park} {type} {building} {room} {orderNo} {orderId} {payLink} {closeTime}。'),
   errorTemplate: Schema.string()
     .role('textarea')
-    .default('电费查询失败: {error}')
-    .description('查询失败时的回复模板。可用变量: {error}。'),
+    .default('电费操作失败: {error}')
+    .description('操作失败时的回复模板。可用变量: {error}。'),
+  cache: Schema.object({
+    time: Schema.natural().default(15).description('缓存时长数值, 0 表示不启用缓存。'),
+    unit: timeUnit,
+  }).description('指令缓存: 一定时间内相同的指令仅触发一次接口请求, 直接回复缓存结果。'),
+  rateLimit: Schema.object({
+    time: Schema.natural().default(0).description('限流窗口数值, 0 表示不启用限流。'),
+    unit: timeUnit,
+  }).description('消息限流: 一个时间窗口内插件只响应一条指令, 其余指令不响应。'),
 })
 
 interface StoredSession {
@@ -107,40 +153,70 @@ export function renderTemplate(template: string, vars: Record<string, unknown>):
   })
 }
 
-/** 从消息文本中解析房间信息 (园区 / 用电类型 / 栋号 / 房间号) */
-export function parseRoomText(text: string): Partial<RoomConfig> {
-  const result: Partial<RoomConfig> = {}
-  if (!text) return result
+interface SplitRoom {
+  room: Partial<RoomConfig>
+  /** 移除已识别片段后的剩余文本 */
+  rest: string
+}
+
+/** 从消息文本中解析房间信息 (园区 / 用电类型 / 栋号 / 房间号), 并返回剩余文本 */
+function splitRoomText(text: string): SplitRoom {
+  const room: Partial<RoomConfig> = {}
+  if (!text) return { room, rest: '' }
   let rest = ` ${text} `
   const park = rest.match(/(榕树|珙桐|松林|银杏|芙蓉|香樟)园?/)
   if (park) {
     // 正则保证取值于六个园区之一, 此处收窄为 Park
-    result.park = (park[1] + '园') as Park
+    room.park = (park[1] + '园') as Park
     rest = rest.replace(park[0], ' ')
   }
   const type = rest.match(/(照明|空调)/)
   if (type) {
-    result.type = type[1] as RoomConfig['type']
+    room.type = type[1] as ElecType
     rest = rest.replace(type[0], ' ')
   }
   const building = rest.match(/(\d{1,2})\s*栋/)
   if (building) {
-    result.building = building[1]
+    room.building = building[1]
     rest = rest.replace(building[0], ' ')
   }
-  const room = rest.match(/(?:\d{1,2}\s*(?:单元|-)\s*)?[A-Za-z]?\d{3,4}/)
-  if (room) {
-    result.roomNo = room[0].replace(/\s+/g, '')
+  const no = rest.match(/(?:\d{1,2}\s*(?:单元|-)\s*)?[A-Za-z]?\d{3,4}/)
+  if (no) {
+    room.roomNo = no[0].replace(/\s+/g, '')
+    rest = rest.replace(no[0], ' ')
   }
-  return result
+  return { room, rest: rest.trim() }
 }
 
+/** 从消息文本中解析房间信息 */
+export function parseRoomText(text: string): Partial<RoomConfig> {
+  return splitRoomText(text).room
+}
+
+/**
+ * 解析充值指令文本: 金额必须显式指定 (带 元/块 后缀或为小数,
+ * 或在房间信息之外的剩余数字); 用电类型必须出现。
+ */
+export function parseChargeText(text: string): { amount?: number; room: Partial<RoomConfig> } {
+  const { room, rest } = splitRoomText(text)
+  const match = rest.match(/(-?\d+(?:\.\d{1,2})?)\s*(?:块钱|元|块)/)
+    ?? rest.match(/(-?\d+\.\d{1,2})/)
+    ?? rest.match(/(?<![-\d.])(\d+)/)
+  return { amount: match ? Number(match[1]) : undefined, room }
+}
+
+/** 除用电类型外的必填房间字段 */
 const REQUIRED_ROOM_FIELDS: [keyof RoomConfig, string][] = [
   ['park', '园区'],
-  ['type', '用电类型'],
   ['building', '栋号'],
   ['roomNo', '房间号'],
 ]
+
+interface ResolvedRoom {
+  park: Park
+  building: string
+  roomNo: string
+}
 
 export class NodeCdutClient {
   private blob?: string
@@ -249,12 +325,18 @@ export class NodeCdutClient {
     throw new Error('重新登录后会话仍失效')
   }
 
-  /** 一站式解析房间并查询剩余电量 */
-  async queryBalance(room: Required<RoomConfig>): Promise<{ routed: Record<string, unknown>; balance: Record<string, unknown> }> {
+  /** 一站式解析房间 */
+  private async resolveRoom(room: ResolvedRoom & { type: ElecType }): Promise<Record<string, unknown>> {
     const routed = asRecord(await this.request('POST', '/paym/electricity/route', { ...room }))
     if (!str(routed.projectId) || !str(routed.areaId) || !str(routed.buildId) || !str(routed.roomId)) {
       throw new Error('房间解析结果缺少必要字段 (projectId/areaId/buildId/roomId)')
     }
+    return routed
+  }
+
+  /** 查询剩余电量 */
+  async queryBalance(room: ResolvedRoom & { type: ElecType }): Promise<{ routed: Record<string, unknown>; balance: Record<string, unknown> }> {
+    const routed = await this.resolveRoom(room)
     const balance = asRecord(await this.request('POST', '/paym/electricity/balance', {
       projectId: routed.projectId,
       areaId: routed.areaId,
@@ -267,54 +349,210 @@ export class NodeCdutClient {
     }
     return { routed, balance }
   }
-}
 
-/** 合并消息中的房间信息与默认配置, 返回缺失字段名列表 */
-function resolveRoom(text: string, fallback: RoomConfig) {
-  const room: RoomConfig = { ...fallback, ...parseRoomText(text) }
-  const missing = REQUIRED_ROOM_FIELDS.filter(([key]) => !room[key]).map(([, label]) => label)
-  return { room, missing }
+  /** 创建电费充值订单 (真实下单, 未支付约 15 分钟自动关闭) */
+  async createOrder(room: ResolvedRoom & { type: ElecType }, amount: number): Promise<{ routed: Record<string, unknown>; order: Record<string, unknown> }> {
+    const routed = await this.resolveRoom(room)
+    const order = asRecord(await this.request('POST', '/paym/electricity/order', {
+      projectId: routed.projectId,
+      areaId: routed.areaId,
+      buildId: routed.buildId,
+      roomId: routed.roomId,
+      levelId: routed.levelId,
+      areaName: routed.areaName,
+      buildName: routed.buildName,
+      levelName: routed.levelName,
+      roomName: routed.roomName,
+      amount,
+      closePrevious: true,
+    }))
+    if (!str(order.orderId)) {
+      throw new Error('创建订单失败: 响应缺少 orderId')
+    }
+    return { routed, order }
+  }
 }
 
 export function apply(ctx: Context, config: Config) {
   const client = new NodeCdutClient(ctx, config)
   const logger = ctx.logger('node-cdut')
 
-  async function query(text: string): Promise<string> {
-    const { room, missing } = resolveRoom(text, config.room)
-    if (missing.length) {
-      return renderTemplate(config.errorTemplate, {
-        error: `缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`,
-      })
+  // ---------- 缓存与限流 ----------
+  const cacheStore = new Map<string, { reply: string; expires: number }>()
+  const cacheMs = config.cache.time * config.cache.unit * 1000
+  const rateLimitMs = config.rateLimit.time * config.rateLimit.unit * 1000
+  let lastServedAt = 0
+
+  /**
+   * 限流与缓存包装: 窗口内已有响应则静默 (返回 undefined);
+   * 缓存命中直接回复; 失败结果不写入缓存。
+   */
+  async function respond(key: string, produce: () => Promise<{ reply: string; cacheable: boolean }>): Promise<string | undefined> {
+    const now = Date.now()
+    if (rateLimitMs > 0 && now - lastServedAt < rateLimitMs) return undefined
+    if (cacheMs > 0) {
+      const hit = cacheStore.get(key)
+      if (hit) {
+        if (hit.expires > now) {
+          lastServedAt = now
+          return hit.reply
+        }
+        cacheStore.delete(key)
+      }
     }
-    // missing 已校验四项必填字段齐全, 此处收窄为 Required
-    const full = room as Required<RoomConfig>
-    const { routed, balance } = await client.queryBalance(full)
-    return renderTemplate(config.replyTemplate, {
-      park: full.park,
-      type: full.type,
-      building: full.building,
-      room: str(routed.roomName) ?? full.roomNo,
-      roomNo: full.roomNo,
+    const { reply, cacheable } = await produce()
+    lastServedAt = Date.now()
+    if (cacheMs > 0 && cacheable) {
+      cacheStore.set(key, { reply, expires: lastServedAt + cacheMs })
+    }
+    return reply
+  }
+
+  // ---------- 房间解析与模板渲染 ----------
+
+  function missingLabels(room: RoomConfig, needType: boolean): string[] {
+    const labels = REQUIRED_ROOM_FIELDS.filter(([key]) => !room[key]).map(([, label]) => label)
+    if (needType && !room.type) labels.splice(1, 0, '用电类型')
+    return labels
+  }
+
+  function errorText(error: string): string {
+    return renderTemplate(config.errorTemplate, { error })
+  }
+
+  /**
+   * 查询用电解析规则:
+   * - 消息携带房间信息 (园区/栋号/房间号任一) 但未指定用电类型时, 照明和空调都查询
+   * - 消息不含任何房间信息时, 整体回退到默认房间配置
+   */
+  function resolveQueryRoom(text: string): { room?: ResolvedRoom & { type: RoomType }; missing: string[] } {
+    const parsed = parseRoomText(text)
+    const hasHint = parsed.park !== undefined || parsed.building !== undefined || parsed.roomNo !== undefined
+    const room: RoomConfig = { ...config.room, ...parsed }
+    if (parsed.type === undefined && hasHint) room.type = 'both'
+    const missing = missingLabels(room, true)
+    if (missing.length) return { missing }
+    // missing 校验后四项齐全, 此处收窄
+    return { room: room as ResolvedRoom & { type: RoomType }, missing }
+  }
+
+  function balanceVars(room: ResolvedRoom, type: ElecType, routed: Record<string, unknown>, balance: Record<string, unknown>) {
+    return {
+      park: room.park,
+      type,
+      building: room.building,
+      room: str(routed.roomName) ?? room.roomNo,
+      roomNo: room.roomNo,
       project: str(routed.projectName),
       remain: str(balance.remain),
       total: str(balance.total),
       canbuy: str(balance.canbuy),
+    }
+  }
+
+  /** 按类型逐条查询并渲染; 单类型失败仅该行为错误信息, 不中断另一类型 */
+  async function queryBalanceLines(room: ResolvedRoom & { type: RoomType }): Promise<{ reply: string; cacheable: boolean }> {
+    const types: ElecType[] = room.type === 'both' ? ['照明', '空调'] : [room.type]
+    const lines: string[] = []
+    let failed = false
+    for (const type of types) {
+      try {
+        const { routed, balance } = await client.queryBalance({ ...room, type })
+        lines.push(renderTemplate(config.replyTemplate, balanceVars(room, type, routed, balance)))
+      } catch (err) {
+        failed = true
+        logger.warn(err)
+        lines.push(renderTemplate(config.errorTemplate, {
+          error: `${type}查询失败: ${err instanceof Error ? err.message : String(err)}`,
+        }))
+      }
+    }
+    return { reply: lines.join('\n'), cacheable: !failed }
+  }
+
+  async function handleQuery(text: string): Promise<string | undefined> {
+    const { room, missing } = resolveQueryRoom(text)
+    if (missing.length || !room) {
+      return errorText(`缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`)
+    }
+    return respond(`balance:${JSON.stringify(room)}`, () => queryBalanceLines(room))
+  }
+
+  /** 充值指令: 必须指定用电类型和金额, 房间可选 (缺省用默认房间) */
+  async function handleCharge(text: string): Promise<string | undefined> {
+    const { amount, room: parsed } = parseChargeText(text)
+    if (!parsed.type) return errorText('请指定用电类型: 照明 或 空调')
+    if (amount === undefined) return errorText('请指定充值金额, 如: 50元')
+    if (!(amount > 0)) return errorText('充值金额必须为正数')
+    const room: RoomConfig = { ...config.room, ...parsed, type: parsed.type }
+    const missing = missingLabels(room, false)
+    if (missing.length) {
+      return errorText(`缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`)
+    }
+    const full = room as ResolvedRoom & { type: ElecType }
+    const key = `charge:${JSON.stringify({ ...full, amount })}`
+    return respond(key, async () => {
+      try {
+        const { routed, order } = await client.createOrder(full, amount)
+        const payLink = asRecord(order.payLink)
+        const reply = renderTemplate(config.chargeTemplate, {
+          amount,
+          park: full.park,
+          type: full.type,
+          building: full.building,
+          room: str(routed.roomName) ?? full.roomNo,
+          roomNo: full.roomNo,
+          orderNo: str(order.orderNo),
+          orderId: str(order.orderId),
+          payLink: str(payLink.urlCode) ?? str(order.cashierUrl),
+          closeTime: str(order.closeTime),
+        })
+        return { reply, cacheable: true }
+      } catch (err) {
+        logger.warn(err)
+        return { reply: errorText(err instanceof Error ? err.message : String(err)), cacheable: false }
+      }
     })
   }
 
+  // ---------- 指令与关键词触发 ----------
+
+  const queryUsage = `可携带房间信息, 如: ${config.keyword} 银杏园 1栋 512 空调; 不指定照明/空调时两者都查询; 缺省使用插件设置中的默认房间。`
   ctx.command(`${config.keyword} [room:text]`, '查询寝室电费余额')
-    .usage(`可携带房间信息, 如: ${config.keyword} 银杏园 1栋 512 空调; 缺省使用插件设置中的默认房间。`)
-    .action(async (_, room) => {
-      try {
-        return await query(room ?? '')
-      } catch (err) {
-        logger.warn(err)
-        return renderTemplate(config.errorTemplate, {
-          error: err instanceof Error ? err.message : String(err),
-        })
+    .usage(queryUsage)
+    .action(async (_, room) => handleQuery(room ?? ''))
+
+  const chargeUsage = `必须指定用电类型和金额, 如: ${config.chargeKeyword} 空调 50元; 房间信息可选, 缺省使用默认房间。`
+  ctx.command(`${config.chargeKeyword} [room:text]`, '充值寝室电费 (创建待支付订单)')
+    .usage(chargeUsage)
+    .action(async (_, room) => handleCharge(room ?? ''))
+
+  if (config.prefix) {
+    // 前缀可以是任意字符串: 在指令解析前的中间件中做纯文本匹配,
+    // 命中前缀指令时直接处理并拦截; 裸关键词消息静默忽略 (仅前缀形式可触发)。
+    ctx.middleware(async (session, next) => {
+      const text = session.stripped?.content
+      if (!text) return next()
+      const { prefix, keyword, chargeKeyword } = config
+      const targets: [string, (rest: string) => Promise<string | undefined>][] = [
+        [prefix + chargeKeyword, handleCharge],
+        [prefix + keyword, handleQuery],
+      ]
+      for (const [trigger, handler] of targets) {
+        if (!text.startsWith(trigger)) continue
+        const reply = await handler(text.slice(trigger.length).trim())
+        if (reply) await session.send(reply)
+        return
       }
-    })
+      if (text === keyword || text.startsWith(keyword + ' ')
+        || text === chargeKeyword || text.startsWith(chargeKeyword + ' ')) {
+        return
+      }
+      return next()
+    }, true)
+  }
+
+  // ---------- 控制台测试页 ----------
 
   ctx.inject(['console'], (ctx) => {
     ctx.console.addEntry({
@@ -333,25 +571,21 @@ export function apply(ctx: Context, config: Config) {
 
     ctx.console.addListener('node-cdut/test-balance', async (room): Promise<TestResult> => {
       try {
-        const override = Object.fromEntries(
-          Object.entries(asRecord(room)).filter(([, v]) => typeof v === 'string' && v !== ''),
-        )
+        const override: Partial<RoomConfig> = {}
+        for (const [key, value] of Object.entries(asRecord(room))) {
+          if (typeof value === 'string' && value !== '') {
+            // 控制台页字段与 RoomConfig 同构, 此处按键名收窄
+            override[key as keyof RoomConfig] = value as never
+          }
+        }
         const merged: RoomConfig = { ...config.room, ...override }
-        const missing = REQUIRED_ROOM_FIELDS.filter(([key]) => !merged[key]).map(([, label]) => label)
+        const missing = missingLabels(merged, true)
         if (missing.length) {
           return { success: false, message: `缺少${missing.join('、')}, 请在页面中填写或在插件设置中配置默认房间。` }
         }
-        // missing 已校验四项必填字段齐全, 此处收窄为 Required
-        const full = merged as Required<RoomConfig>
-        const { routed, balance } = await client.queryBalance(full)
-        const parts = [
-          `${full.park}${full.building}栋 ${str(routed.roomName) ?? full.roomNo} (${full.type})`,
-          `剩余电量 ${str(balance.remain)} 度`,
-        ]
-        const total = str(balance.total)
-        if (total != null) parts.push(`累计用电 ${total} 度`)
-        parts.push(`通道: ${str(routed.projectName) ?? str(routed.projectId)}`)
-        return { success: true, message: parts.join('; ') }
+        const full = merged as ResolvedRoom & { type: RoomType }
+        const { reply } = await queryBalanceLines(full)
+        return { success: true, message: reply }
       } catch (err) {
         return { success: false, message: err instanceof Error ? err.message : String(err) }
       }
