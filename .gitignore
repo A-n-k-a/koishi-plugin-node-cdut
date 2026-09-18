@@ -16,3 +16,6 @@ tsconfig.tsbuildinfo
 *.ntvs*
 *.njsproj
 *.sln
+
+# 登录凭据 (由插件运行时生成, 含会话密钥)
+/session.json

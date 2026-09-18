@@ -5,8 +5,8 @@ import 'virtual:uno.css'
 
 export default (ctx: Context) => {
   ctx.page({
-    name: '扩展页面',
-    path: '/custom-page',
+    name: 'NodeCDUT',
+    path: '/node-cdut',
     component: Page,
   })
 }
