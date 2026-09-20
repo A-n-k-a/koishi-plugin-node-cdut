@@ -2,17 +2,26 @@
   "name": "koishi-plugin-node-cdut",
   "description": "将成都理工大学服务接入Koishi",
   "version": "0.0.1",
+  "contributors": [
+    "A-n-k-a <47747022+A-n-k-a@users.noreply.github.com>"
+  ],
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
     "lib",
     "dist"
   ],
-  "license": "MIT",
+  "license": "AGPL-3.0",
+  "homepage": "https://github.com/A-n-k-a/koishi-plugin-node-cdut",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/A-n-k-a/koishi-plugin-node-cdut.git"
+  },
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "cdut"
   ],
   "devDependencies": {
     "@koishijs/client": "^5.30.4"
@@ -20,5 +29,11 @@
   "peerDependencies": {
     "@koishijs/plugin-console": "^5.30.4",
     "koishi": "^4.18.7"
+  },
+  "koishi": {
+    "description": {
+      "en": "Connect the services of Chengdu University of Technology to Koishi",
+      "zh": "将成都理工大学服务接入Koishi"
+    }
   }
 }

@@ -1,4 +1,4 @@
-import { Context, Schema } from 'koishi'
+import { Context, Schema, Session } from 'koishi'
 import { readFile, writeFile } from 'fs/promises'
 import { resolve } from 'path'
 import {} from '@koishijs/plugin-console'
@@ -48,19 +48,35 @@ export interface TimeConfig {
   unit: 1 | 60 | 3600
 }
 
+export interface PrefixConfig {
+  /** 指令前缀列表; 空列表表示不使用字符串前缀 */
+  list: string[]
+  /** 被 @机器人 也视为指令前缀 */
+  at: boolean
+}
+
+export interface LogConfig {
+  /** 匹配指令时输出收到消息的日志 */
+  received: boolean
+  /** 回复指令时输出发出消息的日志 */
+  sent: boolean
+}
+
 export interface Config {
   baseUrl: string
   username?: string
   password?: string
   room: RoomConfig
-  prefix: string
+  prefix: PrefixConfig
+  menuKeyword: string
   keyword: string
-  replyTemplate: string
   chargeKeyword: string
+  replyTemplate: string
   chargeTemplate: string
   errorTemplate: string
   cache: TimeConfig
   rateLimit: TimeConfig
+  logging: LogConfig
 }
 
 const timeUnit = Schema.union([
@@ -88,9 +104,18 @@ export const Config: Schema<Config> = Schema.object({
     building: Schema.string().description('栋号, 如 `1`。'),
     roomNo: Schema.string().description('房间号, 如 `512` (新开普通道须为 ≥3 位纯数字)。'),
   }).description('默认查询的房间信息 (消息中未携带房间信息时使用)。'),
-  prefix: Schema.string()
-    .default('')
-    .description('指令前缀, 可以是任意字符串 (如 `！`、`/`); 留空表示不使用。设置后仅 `前缀+关键词` 可触发。'),
+  prefix: Schema.object({
+    list: Schema.array(Schema.string())
+      .default([])
+      .description('指令前缀列表, 每项可以是任意字符串 (如 `！`、`/`)。设置后仅 `前缀+关键词` 可触发。'),
+    at: Schema.boolean()
+      .default(false)
+      .description('被 @机器人 也视为指令前缀 (如 `@机器人 查电费`)。'),
+  }).description('指令前缀。前缀列表为空且未开启 @ 识别时不启用此功能, 关键词消息按 Koishi 默认方式解析。'),
+  menuKeyword: Schema.string()
+    .default('CDUT菜单')
+    .pattern(/^\S+$/)
+    .description('菜单指令名称 (不含空格), 用于展示全部可用指令及用法。'),
   keyword: Schema.string()
     .default('查电费')
     .pattern(/^\S+$/)
@@ -119,6 +144,14 @@ export const Config: Schema<Config> = Schema.object({
     time: Schema.natural().default(0).description('限流窗口数值, 0 表示不启用限流。'),
     unit: timeUnit,
   }).description('消息限流: 一个时间窗口内插件只响应一条指令, 其余指令不响应。'),
+  logging: Schema.object({
+    received: Schema.boolean()
+      .default(true)
+      .description('匹配指令时输出日志: 群号 (私聊标注)、用户 ID、消息原文; 命中缓存 / 触发限流时附注。'),
+    sent: Schema.boolean()
+      .default(true)
+      .description('回复指令时输出日志: 群号 (私聊标注)、用户 ID、回复内容。'),
+  }).description('日志开关。'),
 })
 
 interface StoredSession {
@@ -383,19 +416,25 @@ export function apply(ctx: Context, config: Config) {
   const rateLimitMs = config.rateLimit.time * config.rateLimit.unit * 1000
   let lastServedAt = 0
 
+  /** 指令执行结果: reply 为回复内容 (限流时为空); note 为日志附注 (缓存/限流提示) */
+  interface CmdResult {
+    reply?: string
+    note?: string
+  }
+
   /**
-   * 限流与缓存包装: 窗口内已有响应则静默 (返回 undefined);
-   * 缓存命中直接回复; 失败结果不写入缓存。
+   * 限流与缓存包装: 窗口内已有响应则静默 (note 标注限流);
+   * 缓存命中直接回复 (note 标注缓存); 失败结果不写入缓存。
    */
-  async function respond(key: string, produce: () => Promise<{ reply: string; cacheable: boolean }>): Promise<string | undefined> {
+  async function respond(key: string, produce: () => Promise<{ reply: string; cacheable: boolean }>): Promise<CmdResult> {
     const now = Date.now()
-    if (rateLimitMs > 0 && now - lastServedAt < rateLimitMs) return undefined
+    if (rateLimitMs > 0 && now - lastServedAt < rateLimitMs) return { note: '触发限流, 本次不响应' }
     if (cacheMs > 0) {
       const hit = cacheStore.get(key)
       if (hit) {
         if (hit.expires > now) {
           lastServedAt = now
-          return hit.reply
+          return { reply: hit.reply, note: '命中缓存' }
         }
         cacheStore.delete(key)
       }
@@ -405,7 +444,7 @@ export function apply(ctx: Context, config: Config) {
     if (cacheMs > 0 && cacheable) {
       cacheStore.set(key, { reply, expires: lastServedAt + cacheMs })
     }
-    return reply
+    return { reply }
   }
 
   // ---------- 房间解析与模板渲染 ----------
@@ -470,24 +509,24 @@ export function apply(ctx: Context, config: Config) {
     return { reply: lines.join('\n'), cacheable: !failed }
   }
 
-  async function handleQuery(text: string): Promise<string | undefined> {
+  async function handleQuery(text: string): Promise<CmdResult> {
     const { room, missing } = resolveQueryRoom(text)
     if (missing.length || !room) {
-      return errorText(`缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`)
+      return { reply: errorText(`缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`) }
     }
     return respond(`balance:${JSON.stringify(room)}`, () => queryBalanceLines(room))
   }
 
   /** 充值指令: 必须指定用电类型和金额, 房间可选 (缺省用默认房间) */
-  async function handleCharge(text: string): Promise<string | undefined> {
+  async function handleCharge(text: string): Promise<CmdResult> {
     const { amount, room: parsed } = parseChargeText(text)
-    if (!parsed.type) return errorText('请指定用电类型: 照明 或 空调')
-    if (amount === undefined) return errorText('请指定充值金额, 如: 50元')
-    if (!(amount > 0)) return errorText('充值金额必须为正数')
+    if (!parsed.type) return { reply: errorText('请指定用电类型: 照明 或 空调') }
+    if (amount === undefined) return { reply: errorText('请指定充值金额, 如: 50元') }
+    if (!(amount > 0)) return { reply: errorText('充值金额必须为正数') }
     const room: RoomConfig = { ...config.room, ...parsed, type: parsed.type }
     const missing = missingLabels(room, false)
     if (missing.length) {
-      return errorText(`缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`)
+      return { reply: errorText(`缺少${missing.join('、')}信息, 请在消息中补充或在插件设置中配置默认房间`) }
     }
     const full = room as ResolvedRoom & { type: ElecType }
     const key = `charge:${JSON.stringify({ ...full, amount })}`
@@ -515,37 +554,97 @@ export function apply(ctx: Context, config: Config) {
     })
   }
 
-  // ---------- 指令与关键词触发 ----------
+  // ---------- 指令注册表 ----------
+  // 新增指令时向 commands 追加一项即可: Koishi 指令注册、前缀中间件匹配与菜单内容均由此派生。
+
+  interface PluginCommand {
+    keyword: string
+    description: string
+    usage: string
+    handle: (text: string) => Promise<CmdResult>
+  }
 
   const queryUsage = `可携带房间信息, 如: ${config.keyword} 银杏园 1栋 512 空调; 不指定照明/空调时两者都查询; 缺省使用插件设置中的默认房间。`
-  ctx.command(`${config.keyword} [room:text]`, '查询寝室电费余额')
-    .usage(queryUsage)
-    .action(async (_, room) => handleQuery(room ?? ''))
-
   const chargeUsage = `必须指定用电类型和金额, 如: ${config.chargeKeyword} 空调 50元; 房间信息可选, 缺省使用默认房间。`
-  ctx.command(`${config.chargeKeyword} [room:text]`, '充值寝室电费 (创建待支付订单)')
-    .usage(chargeUsage)
-    .action(async (_, room) => handleCharge(room ?? ''))
 
-  if (config.prefix) {
+  // 菜单指令置顶, 其余指令按注册顺序排列
+  const commands: PluginCommand[] = [
+    {
+      keyword: config.menuKeyword,
+      description: '显示本菜单',
+      usage: '直接发送即可查看全部可用指令及用法。',
+      handle: () => respond('menu', async () => ({ reply: menuText(), cacheable: true })),
+    },
+    { keyword: config.keyword, description: '查询寝室电费余额', usage: queryUsage, handle: handleQuery },
+    { keyword: config.chargeKeyword, description: '充值寝室电费 (创建待支付订单)', usage: chargeUsage, handle: handleCharge },
+  ]
+
+  /** 菜单内容从指令注册表派生, 新增指令自动出现在菜单中 */
+  function menuText(): string {
+    const lines = commands.map((cmd, index) => `${index + 1}. ${cmd.keyword}: ${cmd.description}\n   用法: ${cmd.usage}`)
+    return `【CDUT 菜单】共 ${commands.length} 个可用指令:\n${lines.join('\n')}`
+  }
+
+  /** 日志上下文: 群号 (私聊时标注) 与用户 ID */
+  function logContext(session: Session): string {
+    return `${session.guildId ? `群 ${session.guildId}` : '私聊'} | 用户 ${session.userId}`
+  }
+
+  /** 收到日志: 输出群号、用户 ID 与消息原文; 缓存/限流时附注 */
+  function logReceived(session: Session, cmd: PluginCommand, note?: string) {
+    logger.info('匹配指令 [%s] | %s | 消息: %s%s',
+      cmd.keyword, logContext(session), session.content, note ? ` | ${note}` : '')
+  }
+
+  /** 发出日志: 输出群号、用户 ID 与回复内容 */
+  function logSent(session: Session, cmd: PluginCommand, reply: string) {
+    logger.info('回复指令 [%s] | %s | 回复: %s', cmd.keyword, logContext(session), reply)
+  }
+
+  async function dispatch(session: Session, cmd: PluginCommand, text: string) {
+    const { reply, note } = await cmd.handle(text)
+    if (config.logging.received) logReceived(session, cmd, note)
+    if (reply) {
+      await session.send(reply)
+      if (config.logging.sent) logSent(session, cmd, reply)
+    }
+  }
+
+  // 关键词较长的指令优先匹配, 避免短关键词遮蔽长关键词
+  const sortedCommands = [...commands].sort((a, b) => b.keyword.length - a.keyword.length)
+
+  for (const cmd of commands) {
+    ctx.command(`${cmd.keyword} [room:text]`, cmd.description)
+      .usage(cmd.usage)
+      .action(({ session }, room) => dispatch(session, cmd, room ?? ''))
+  }
+
+  const prefixList = config.prefix.list.filter(Boolean)
+  if (prefixList.length || config.prefix.at) {
     // 前缀可以是任意字符串: 在指令解析前的中间件中做纯文本匹配,
     // 命中前缀指令时直接处理并拦截; 裸关键词消息静默忽略 (仅前缀形式可触发)。
     ctx.middleware(async (session, next) => {
-      const text = session.stripped?.content
+      const stripped = session.stripped
+      const text = stripped?.content
       if (!text) return next()
-      const { prefix, keyword, chargeKeyword } = config
-      const targets: [string, (rest: string) => Promise<string | undefined>][] = [
-        [prefix + chargeKeyword, handleCharge],
-        [prefix + keyword, handleQuery],
-      ]
-      for (const [trigger, handler] of targets) {
+      // 前缀较长的优先匹配, 避免短前缀遮蔽长前缀
+      const triggers = prefixList
+        .flatMap((prefix) => sortedCommands.map((cmd): [string, PluginCommand] => [prefix + cmd.keyword, cmd]))
+        .sort((a, b) => b[0].length - a[0].length)
+      for (const [trigger, cmd] of triggers) {
         if (!text.startsWith(trigger)) continue
-        const reply = await handler(text.slice(trigger.length).trim())
-        if (reply) await session.send(reply)
+        await dispatch(session, cmd, text.slice(trigger.length).trim())
         return
       }
-      if (text === keyword || text.startsWith(keyword + ' ')
-        || text === chargeKeyword || text.startsWith(chargeKeyword + ' ')) {
+      // @ 机器人视为前缀: stripped.content 已剥离开头的 @ 元素
+      if (config.prefix.at && stripped.atSelf) {
+        for (const cmd of sortedCommands) {
+          if (!text.startsWith(cmd.keyword)) continue
+          await dispatch(session, cmd, text.slice(cmd.keyword.length).trim())
+          return
+        }
+      }
+      if (sortedCommands.some((cmd) => text === cmd.keyword || text.startsWith(cmd.keyword + ' '))) {
         return
       }
       return next()
