@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-node-cdut",
   "description": "将成都理工大学服务接入Koishi",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "contributors": [
     "A-n-k-a <47747022+A-n-k-a@users.noreply.github.com>"
   ],

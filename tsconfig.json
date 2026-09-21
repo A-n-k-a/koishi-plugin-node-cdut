@@ -3,6 +3,7 @@
     "rootDir": "src",
     "outDir": "lib",
     "target": "es2022",
+    "lib": ["es2024"],
     "module": "esnext",
     "declaration": true,
     "emitDeclarationOnly": true,

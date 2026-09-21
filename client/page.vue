@@ -54,6 +54,39 @@
           show-icon
         />
       </el-card>
+
+      <el-card class="node-cdut-card" shadow="never">
+        <template #header>
+          <div class="card-header cron-header">
+            <span>定时任务</span>
+            <el-button text type="primary" :loading="cronLoading" @click="loadCronTimes">刷新</el-button>
+          </div>
+        </template>
+        <p class="hint">
+          定时任务在插件设置中配置; 此处展示每个任务的指令、目标与未来触发时间 (显示条数由设置中的「未来触发次数」指定)。
+        </p>
+        <el-empty v-if="!cronLoading && !cronJobs.length" description="未配置定时任务" />
+        <div v-for="(job, index) in cronJobs" :key="index" class="cron-job">
+          <div class="cron-job-title">
+            <el-tag size="small" :type="job.enabled ? 'success' : 'info'">{{ job.enabled ? '已启用' : '未启用' }}</el-tag>
+            <el-tag size="small" type="warning">{{ job.command }}</el-tag>
+            <code>{{ job.expression || '(未设置表达式)' }}</code>
+          </div>
+          <div v-if="job.arguments" class="cron-detail">参数: {{ job.arguments }}</div>
+          <div class="cron-detail">目标: {{ job.targets.length ? job.targets.join(', ') : '(未设置目标)' }}</div>
+          <el-alert
+            v-if="job.error"
+            class="result"
+            type="error"
+            :title="job.error"
+            :closable="false"
+            show-icon
+          />
+          <ul v-else class="cron-times">
+            <li v-for="(time, i) in job.times" :key="i">{{ formatTime(time) }}</li>
+          </ul>
+        </div>
+      </el-card>
     </div>
   </k-layout>
 </template>
@@ -91,6 +124,34 @@ async function testLogin() {
 
 const balanceLoading = ref(false)
 const balanceResult = ref<TestResult>()
+
+interface CronJobPreview {
+  command: string
+  arguments: string
+  expression: string
+  targets: string[]
+  enabled: boolean
+  times: string[]
+  error?: string
+}
+
+const cronLoading = ref(false)
+const cronJobs = ref<CronJobPreview[]>([])
+
+async function loadCronTimes() {
+  cronLoading.value = true
+  try {
+    cronJobs.value = await send('node-cdut/cron-times')
+  } finally {
+    cronLoading.value = false
+  }
+}
+
+function formatTime(iso: string) {
+  return new Date(iso).toLocaleString('zh-CN', { hour12: false })
+}
+
+loadCronTimes()
 
 async function testBalance() {
   balanceLoading.value = true
@@ -135,5 +196,39 @@ async function testBalance() {
 .result {
   margin-top: 1rem;
   white-space: pre-wrap;
+}
+
+.cron-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.cron-job + .cron-job {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--el-border-color-lighter);
+}
+
+.cron-job-title {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
+.cron-detail {
+  margin-top: 0.25rem;
+  color: var(--el-text-color-secondary);
+  font-size: 0.9em;
+}
+
+.cron-target {
+  color: var(--el-text-color-secondary);
+}
+
+.cron-times {
+  margin: 0.5rem 0 0;
+  padding-left: 1.5rem;
 }
 </style>
